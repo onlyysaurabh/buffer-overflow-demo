@@ -1,5 +1,5 @@
-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
-
 dmesg | tail -n 2
+# Check kernel messages after crash/segfault to verify instruction pointer value
 
-python3 byte.fromhex("40120d")
+python3 -c "print(bytes.fromhex('e6910408')[::-1])"
+# Convert hex address to little-endian bytes for the exploit payload

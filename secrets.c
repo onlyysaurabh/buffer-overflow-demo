@@ -17,7 +17,7 @@ int isValidPassword(char *input)
 	}
 
 	ssize_t n_read = read(fd, actual_password, 1024);
-	if (actual_password[n_read-1] == 0xa)
+	if (n_read > 0 && actual_password[n_read-1] == 0xa)
 	{
 		actual_password[n_read-1] = 0x0;
 	}
